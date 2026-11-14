@@ -1,8 +1,0 @@
-{
-  "DatabaseUrl": "https://YOUR_PROJECT-default-rtdb.firebaseio.com",
-  "ApiKey": "YOUR_FIREBASE_CLIENT_API_KEY",
-  "ProjectId": "YOUR_PROJECT",
-  "AuthDomain": "YOUR_PROJECT.firebaseapp.com",
-  "EmulatorMode": false,
-  "AuthEmulatorUrl": ""
-}
