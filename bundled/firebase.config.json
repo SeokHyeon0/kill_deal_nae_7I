@@ -1,0 +1,8 @@
+{
+  "DatabaseUrl": "http://127.0.0.1:9000",
+  "ApiKey": "demo-killdeal-signpath",
+  "ProjectId": "demo-killdeal-signpath",
+  "AuthDomain": "",
+  "EmulatorMode": true,
+  "AuthEmulatorUrl": "http://127.0.0.1:9099"
+}

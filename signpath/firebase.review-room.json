@@ -1,0 +1,28 @@
+{
+  "spark": {
+    "lobby": {
+      "00000000000040008000000000000001": {
+        "name": "심사용 킬내기",
+        "ownerUid": "__shared_bj__",
+        "running": true,
+        "session": 0
+      }
+    },
+    "rooms": {
+      "00000000000040008000000000000001": {
+        "game": {
+          "generation": 0,
+          "roundCount": 50,
+          "control": {
+            "running": true,
+            "session": 0
+          },
+          "room": {
+            "name": "심사용 킬내기",
+            "ownerUid": "__shared_bj__"
+          }
+        }
+      }
+    }
+  }
+}
