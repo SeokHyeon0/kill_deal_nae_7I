@@ -1,0 +1,186 @@
+name: Windows build
+
+on:
+  push:
+    branches: ['**']
+  pull_request:
+  workflow_dispatch:
+    inputs:
+      mode:
+        description: Build for review, test SignPath, or sign a release candidate
+        type: choice
+        required: true
+        default: review-build
+        options:
+          - review-build
+          - signpath-test
+          - signpath-release-candidate
+
+permissions:
+  actions: read
+  contents: read
+
+jobs:
+  build:
+    runs-on: windows-2022
+    timeout-minutes: 15
+    outputs:
+      artifact-id: ${{ steps.upload.outputs.artifact-id }}
+      package-version: ${{ steps.compile.outputs.package-version }}
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          persist-credentials: false
+
+      - name: Build and inspect both Windows EXEs
+        id: compile
+        shell: pwsh
+        env:
+          MODE: ${{ inputs.mode }}
+          DEFAULT_BRANCH: ${{ github.event.repository.default_branch }}
+        run: |
+          $ErrorActionPreference = 'Stop'
+          if ($env:MODE -in @('signpath-test', 'signpath-release-candidate') -and
+              $env:GITHUB_REF -cne "refs/heads/$env:DEFAULT_BRANCH") {
+            throw 'Run SignPath jobs from the default branch.'
+          }
+
+          $output = Join-Path $env:RUNNER_TEMP 'killdeal-build'
+          $artifacts = Join-Path $env:RUNNER_TEMP 'killdeal-artifacts'
+          New-Item -ItemType Directory -Path $artifacts | Out-Null
+          if ($env:MODE -eq 'signpath-release-candidate') {
+            $configPath = 'signpath/firebase.release.json'
+            if (!(Test-Path -LiteralPath $configPath -PathType Leaf)) {
+              throw 'Commit the verified production client config to signpath/firebase.release.json.'
+            }
+
+            $config = Get-Content -LiteralPath $configPath -Raw | ConvertFrom-Json
+            $dbUrl = $null
+            if ($config.EmulatorMode -isnot [bool] -or $config.EmulatorMode -or
+                ![Uri]::TryCreate($config.DatabaseUrl, [UriKind]::Absolute, [ref] $dbUrl) -or
+                $dbUrl.Scheme -ne 'https' -or $dbUrl.IsLoopback -or
+                $dbUrl.Host -notmatch '(?i)(?:^[a-z0-9-]+\.firebaseio\.com$|^[a-z0-9-]+\.[a-z0-9-]+\.firebasedatabase\.app$)' -or
+                $config.ApiKey -cnotmatch '^AIza[0-9A-Za-z_-]{35}$' -or
+                $config.ProjectId -notmatch '^[a-z][a-z0-9-]+[a-z0-9]$') {
+              throw 'The production Firebase client config must specify a real HTTPS Realtime Database, project ID, and Firebase client API key.'
+            }
+            .\Build-SingleFile.ps1 -OutputDirectory $output -Role Both -FirebaseConfiguration (Resolve-Path -LiteralPath $configPath).Path
+          } else {
+            .\Build-SingleFile.ps1 -OutputDirectory $output -Role Both -ReviewBuild
+          }
+
+          $files = [ordered]@{
+            '킬딜내기_BJ.exe' = 'KillDeal-BJ.exe'
+            '킬딜내기_시청자.exe' = 'KillDeal-Viewer.exe'
+          }
+          $version = $null
+          foreach ($name in $files.Keys) {
+            $file = Get-Item -LiteralPath (Join-Path $output $name)
+            $info = $file.VersionInfo
+            if ($info.ProductName -cne '킬딜내기' -or
+                $info.FileVersion -notmatch '^[0-9]+(\.[0-9]+){3}$' -or
+                $info.ProductVersion -ne $info.FileVersion) {
+              throw "Unexpected Windows version metadata for $name."
+            }
+            if ($null -eq $version) { $version = $info.FileVersion }
+            if ($info.FileVersion -ne $version) { throw 'BJ and Viewer build versions differ.' }
+            if ((Get-AuthenticodeSignature -LiteralPath $file.FullName).Status -ne 'NotSigned') {
+              throw "Expected an unsigned CI build for $name."
+            }
+            Copy-Item -LiteralPath $file.FullName -Destination (Join-Path $artifacts $files[$name])
+          }
+          "package-version=$version" >> $env:GITHUB_OUTPUT
+
+      - name: Upload unsigned build for review or signing
+        id: upload
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: ${{ inputs.mode == 'signpath-release-candidate' && 'killdeal-release-candidate-unsigned' || 'killdeal-review-unsigned' }}
+          path: |
+            ${{ runner.temp }}/killdeal-artifacts/KillDeal-BJ.exe
+            ${{ runner.temp }}/killdeal-artifacts/KillDeal-Viewer.exe
+          if-no-files-found: error
+          compression-level: 6
+          retention-days: 7
+
+  signpath:
+    if: >-
+      github.event_name == 'workflow_dispatch' &&
+      (inputs.mode == 'signpath-test' || inputs.mode == 'signpath-release-candidate') &&
+      github.ref == format('refs/heads/{0}', github.event.repository.default_branch)
+    needs: build
+    runs-on: windows-2022
+    environment: signpath
+    timeout-minutes: 65
+    steps:
+      - name: Validate SignPath configuration
+        shell: pwsh
+        env:
+          SIGNPATH_ORGANIZATION_ID: ${{ vars.SIGNPATH_ORGANIZATION_ID }}
+          SIGNPATH_PROJECT_SLUG: ${{ vars.SIGNPATH_PROJECT_SLUG }}
+          SIGNPATH_SIGNING_POLICY_SLUG: ${{ vars.SIGNPATH_SIGNING_POLICY_SLUG }}
+          SIGNPATH_ARTIFACT_CONFIGURATION_SLUG: ${{ vars.SIGNPATH_ARTIFACT_CONFIGURATION_SLUG }}
+          SIGNPATH_API_TOKEN: ${{ secrets.SIGNPATH_API_TOKEN }}
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $required = @(
+            'SIGNPATH_ORGANIZATION_ID', 'SIGNPATH_PROJECT_SLUG',
+            'SIGNPATH_SIGNING_POLICY_SLUG', 'SIGNPATH_ARTIFACT_CONFIGURATION_SLUG',
+            'SIGNPATH_API_TOKEN'
+          )
+          foreach ($name in $required) {
+            if ([string]::IsNullOrWhiteSpace([Environment]::GetEnvironmentVariable($name))) {
+              throw "Configure $name in GitHub before requesting signing."
+            }
+          }
+
+      - name: Request SignPath signing and wait for manual approval
+        uses: signpath/github-action-submit-signing-request@f6d04783b4569d051e0c80105fe66e82819d0092 # v3
+        with:
+          api-token: ${{ secrets.SIGNPATH_API_TOKEN }}
+          organization-id: ${{ vars.SIGNPATH_ORGANIZATION_ID }}
+          project-slug: ${{ vars.SIGNPATH_PROJECT_SLUG }}
+          signing-policy-slug: ${{ vars.SIGNPATH_SIGNING_POLICY_SLUG }}
+          artifact-configuration-slug: ${{ vars.SIGNPATH_ARTIFACT_CONFIGURATION_SLUG }}
+          github-artifact-id: ${{ needs.build.outputs.artifact-id }}
+          wait-for-completion: true
+          wait-for-completion-timeout-in-seconds: 3600
+          output-artifact-directory: ${{ runner.temp }}/killdeal-signed
+          parameters: |
+            version: ${{ toJSON(needs.build.outputs.package-version) }}
+
+      - name: Verify both signatures and file metadata
+        shell: pwsh
+        env:
+          EXPECTED_VERSION: ${{ needs.build.outputs.package-version }}
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $directory = Join-Path $env:RUNNER_TEMP 'killdeal-signed'
+          $files = @(Get-ChildItem -LiteralPath $directory -Force)
+          $expected = @('KillDeal-BJ.exe', 'KillDeal-Viewer.exe')
+          if ($files.Count -ne $expected.Count -or
+              @($files | Where-Object { $_.PSIsContainer -or $_.Name -cnotin $expected }).Count -ne 0) {
+            throw 'The signing response must contain exactly the BJ and Viewer EXEs.'
+          }
+          foreach ($file in $files) {
+            $info = $file.VersionInfo
+            if ($info.ProductName -cne '킬딜내기' -or
+                $info.FileVersion -ne $env:EXPECTED_VERSION -or
+                $info.ProductVersion -ne $env:EXPECTED_VERSION) {
+              throw "Unexpected Windows version metadata for $($file.Name)."
+            }
+            $signature = Get-AuthenticodeSignature -LiteralPath $file.FullName
+            if ($signature.Status -ne 'Valid' -or $null -eq $signature.TimeStamperCertificate -or
+                $signature.SignerCertificate.GetNameInfo([System.Security.Cryptography.X509Certificates.X509NameType]::SimpleName, $false) -ne 'SignPath Foundation') {
+              throw "Expected a valid timestamped SignPath Foundation signature for $($file.Name)."
+            }
+            Get-FileHash -LiteralPath $file.FullName -Algorithm SHA256 | Format-List
+          }
+
+      - name: Save verified EXEs from SignPath
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: ${{ inputs.mode == 'signpath-release-candidate' && 'killdeal-signpath-release-candidate' || 'killdeal-signpath-verification' }}
+          path: ${{ runner.temp }}/killdeal-signed/*.exe
+          if-no-files-found: error
+          retention-days: 14
